@@ -13,9 +13,13 @@ import threading
 """
 Advanced test script for the netclocks program.
 This script tests synchronization functionality by:
-1. Starting two instances of the program
+1. Starting instances of the program
 2. Testing leader election
 3. Testing time synchronization between instances
+
+Tests are separated into two classes:
+- SingleNodeSyncTest: Tests that require only one program instance
+- MultiNodeSyncTest: Tests that require multiple program instances interacting
 """
 
 from test_utils import MessageType, LeaderState, capture_stderr, is_stderr_capture_active
@@ -43,8 +47,241 @@ def output_reader(process, prefix):
             # If capture is active, wait briefly before checking again
             time.sleep(0.1)
 
-class SyncTest(unittest.TestCase):
-    """Tests for synchronization functionality"""
+class SingleNodeSyncTest(unittest.TestCase):
+    """Tests for synchronization functionality with a single program instance"""
+    
+    def setUp(self):
+        """Setup test environment with a single program instance"""
+        self.program_path = "../peer-time-sync"
+        
+        # Program configuration
+        self.program_port = 12345
+        self.program_address = "127.0.0.1"
+        
+        # Create socket for sending/receiving
+        self.sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        self.sock.settimeout(2)  # 2 second timeout
+        self.client_port = 54321
+        self.sock.bind(('', self.client_port))
+        
+        # Start program with output prefixing
+        cmd = [self.program_path, "-p", str(self.program_port), "-b", self.program_address]
+        self.program = subprocess.Popen(
+            cmd, 
+            stdout=subprocess.PIPE, 
+            stderr=subprocess.PIPE, 
+            bufsize=1,
+            text=True
+        )
+        
+        # Start output reader thread
+        self.reader = threading.Thread(
+            target=output_reader,
+            args=(self.program, f"PROGRAM:{self.program_port}")
+        )
+        self.reader.daemon = True
+        self.reader.start()
+        
+        # Wait a moment for the program to start
+        time.sleep(1)
+    
+    def tearDown(self):
+        """Clean up after test"""
+        # Close the socket
+        self.sock.close()
+        
+        # Terminate the program
+        if hasattr(self, 'program') and self.program:
+            self.program.terminate()
+            try:
+                self.program.wait(timeout=2)
+            except subprocess.TimeoutExpired:
+                self.program.kill()
+
+    def send_message(self, message_type, content=None):
+        """Send a message to the program"""
+        message = bytes([message_type])
+        
+        if content is not None:
+            message += content
+        
+        self.sock.sendto(message, (self.program_address, self.program_port))
+    
+    def receive_message(self, timeout=2):
+        """Receive a message from the program"""
+        self.sock.settimeout(timeout)
+        try:
+            data, addr = self.sock.recvfrom(65535)  # Max UDP packet size
+            if data:
+                msg_type = data[0] if data else None
+                content = data[1:] if len(data) > 1 else None
+                return (msg_type, content, addr)
+            return None
+        except socket.timeout:
+            return None
+
+    def create_leader_message(self, state):
+        """Create a leader message with the given state"""
+        return bytes([int(state)])
+
+    def create_sync_start_message(self, sync_level, timestamp):
+        """Create a SYNC_START message"""
+        # 1 byte sync level + 8 byte timestamp (big endian)
+        return bytes([sync_level]) + struct.pack('!Q', timestamp)
+
+    def test_sync_start(self):
+        """Test the SYNC_START message processing for a single node"""
+        # Connect to establish relationship with the program
+        self.send_message(MessageType.CONNECT)
+        _ = self.receive_message()  # Discard ACK_CONNECT
+        
+        # Create and send a SYNC_START message
+        current_time = int(time.time() * 1000)  # Current time in milliseconds
+        sync_content = self.create_sync_start_message(0, current_time)
+        self.send_message(MessageType.SYNC_START, sync_content)
+        
+        # Wait for the DELAY_REQUEST
+        response = self.receive_message(timeout=3)
+        self.assertIsNotNone(response, "No response received for SYNC_START message")
+        msg_type, content, _ = response
+        self.assertEqual(msg_type, MessageType.DELAY_REQUEST,
+                         f"Expected DELAY_REQUEST (12), got {msg_type}")
+
+        # Send a DELAY_RESPONSE with current time
+        current_time = int(time.time() * 1000)
+        delay_response_content = self.create_sync_start_message(0, current_time)
+        self.send_message(MessageType.DELAY_RESPONSE, delay_response_content)
+        
+        # Wait for the SYNC_START message, when we get it, we should know that the node has synchronized with us
+        response = self.receive_message(timeout=10)
+        self.assertIsNotNone(response, "Node didn't send a SYNC_START in 10 seconds")
+        msg_type, content, _ = response
+        self.assertEqual(msg_type, MessageType.SYNC_START,
+                         f"Expected SYNC_START (11), got {msg_type}")
+        sync_level = content[0]
+        self.assertEqual(sync_level, 1, "Invalid sync level in SYNC_START message")
+        
+        # Check that the timestamp is close to the current time
+        timestamp = struct.unpack('!Q', content[1:9])[0]
+        current_time = int(time.time() * 1000)
+        self.assertAlmostEqual(timestamp, current_time, delta=100, 
+                               msg="Timestamp in SYNC_START message is not close to current time")
+
+    def test_changed_sync_level(self):
+        """Test that the node recognises a synchronization source 
+        changing its sync level between SYNC_START and DELAY_RESPONSE as an error"""
+        with capture_stderr(self.program) as stderr_capture:
+            # Connect to the node
+            self.send_message(MessageType.CONNECT)
+            # Discard the ACK_CONNECT
+            _ = self.receive_message()
+
+            # Send a sync start to the node
+            sync_content = self.create_sync_start_message(0, 0)
+            self.send_message(MessageType.SYNC_START, sync_content)
+
+            # Wait for the DELAY_REQUEST
+            delay_rq = self.receive_message()
+            self.assertIsNotNone(delay_rq, "No response received for SYNC_START message")
+            msg_type, content, _ = delay_rq
+            self.assertEqual(msg_type, MessageType.DELAY_REQUEST,
+                             f"Expected DELAY_REQUEST (12), got {msg_type}")
+
+            # Send a DELAY_RESPONSE with sync level 1
+            delay_response_content = self.create_sync_start_message(1, 0)
+            self.send_message(MessageType.DELAY_RESPONSE, delay_response_content)
+            
+            # Wait a bit for the node to process the message
+            time.sleep(1)
+            
+            # Ensure the node prints an error message
+            err_output = stderr_capture.get_output()
+            self.assertIn("ERROR MSG", err_output.upper(),
+                   "The node should print an ERROR upon receiving a DELAY_RESPONSE with a different sync level")
+
+            # And that its still not synchronized
+            self.send_message(MessageType.GET_TIME)
+            # Get the TIME response
+            response = self.receive_message()
+            self.assertIsNotNone(response, "No response received for GET_TIME message")
+            msg_type, content, _ = response
+            self.assertEqual(msg_type, MessageType.TIME,
+                             f"Expected TIME (32), got {msg_type}")
+            # We should see that the sync level is 255, indicating that this node is not synchronized
+            sync_level = content[0]
+            self.assertTrue(sync_level == 255, "The node should not be synchronized after an unsuccessful sync")
+    
+    def test_incoming_sync_timeout(self):
+        """Test that the node times out if it doesn't receive a DELAY_RESPONSE in time"""
+        with capture_stderr(self.program) as stderr_capture:
+            # Connect to the node
+            self.send_message(MessageType.CONNECT)
+            # Discard the ACK_CONNECT
+            _ = self.receive_message()
+
+            # Send a sync start to the node
+            sync_content = self.create_sync_start_message(0, 0)
+            self.send_message(MessageType.SYNC_START, sync_content)
+
+            # Wait for the DELAY_REQUEST
+            delay_rq = self.receive_message()
+            self.assertIsNotNone(delay_rq, "No response received for SYNC_START message")
+            msg_type, content, _ = delay_rq
+            self.assertEqual(msg_type, MessageType.DELAY_REQUEST,
+                             f"Expected DELAY_REQUEST (12), got {msg_type}")
+
+            # Wait for a while without sending a DELAY_RESPONSE
+            print("Going to sleep for 10 secs - be patient")
+            time.sleep(10)
+
+            # Reply after the delay
+            delay_response_content = self.create_sync_start_message(0, 0)
+            self.send_message(MessageType.DELAY_RESPONSE, delay_response_content)
+            
+            # Wait a bit for the node to process the message
+            time.sleep(1)
+            # Ensure the node prints an error message
+            err_output = stderr_capture.get_output()
+            self.assertIn("ERROR MSG", err_output.upper(),
+                   "The node should print an ERROR receiving a DELAY_RESPONSE after a timeout")
+
+    def test_outcoming_sync_timeout(self):
+        """Test handling of outgoing synchronization timeout"""
+        with capture_stderr(self.program) as stderr_capture:
+            # Connect to the node
+            self.send_message(MessageType.CONNECT)
+            # Discard the ACK_CONNECT
+            _ = self.receive_message()
+
+            # Send a LEADER_START to the node
+            leader_content = self.create_leader_message(LeaderState.LEADER_BEGIN)
+            self.send_message(MessageType.LEADER, leader_content)
+            
+            # Wait to receive the SYNC_START
+            response = self.receive_message(timeout=3)
+            self.assertIsNotNone(response, "No response received for LEADER message")
+            msg_type, content, _ = response
+            self.assertEqual(msg_type, MessageType.SYNC_START,
+                             f"Expected SYNC_START (11), got {msg_type}")
+            
+            # Now take back the leader status
+            leader_content = self.create_leader_message(LeaderState.LEADER_STOP)
+            self.send_message(MessageType.LEADER, leader_content)
+            
+            # Wait for a while for the node to process the message
+            time.sleep(1)
+
+            # Send a DELAY_REQUEST to the node
+            self.send_message(MessageType.DELAY_REQUEST)
+            
+            # Check that the node recognizes this as an error
+            err_output = stderr_capture.get_output()
+            self.assertIn("ERROR MSG", err_output.upper(),
+                   "The node should print an ERROR receiving a DELAY_REQUEST after a LEADER_STOP")
+
+
+class MultiNodeSyncTest(unittest.TestCase):
+    """Tests for synchronization functionality between multiple program instances"""
     
     def setUp(self):
         """Setup test environment with two program instances"""
@@ -69,14 +306,14 @@ class SyncTest(unittest.TestCase):
         self.client2_port = 54322
         self.sock2.bind(('', self.client2_port))
         
-        # Start the first program with output prefixing - Fixed buffering warning by using text mode
+        # Start the first program with output prefixing
         cmd1 = [self.program_path, "-p", str(self.program1_port), "-b", self.program1_address]
         self.program1 = subprocess.Popen(
             cmd1, 
             stdout=subprocess.PIPE, 
             stderr=subprocess.PIPE, 
             bufsize=1,
-            text=True  # Use text mode instead of binary mode
+            text=True
         )
         
         # Start output reader thread for first program
@@ -90,7 +327,7 @@ class SyncTest(unittest.TestCase):
         # Wait a moment for the first program to start
         time.sleep(1)
         
-        # Start the second program and connect it to the first, with output prefixing
+        # Start the second program and connect it to the first
         cmd2 = [
             self.program_path,
             "-p", str(self.program2_port),
@@ -103,7 +340,7 @@ class SyncTest(unittest.TestCase):
             stdout=subprocess.PIPE, 
             stderr=subprocess.PIPE, 
             bufsize=1,
-            text=True  # Use text mode instead of binary mode
+            text=True
         )
         
         # Start output reader thread for second program
@@ -210,8 +447,6 @@ class SyncTest(unittest.TestCase):
         self.assertAlmostEqual(timestamp1, 3000, delta=100, msg="First instance timestamp is not close to 2000")
         self.assertAlmostEqual(timestamp2, 2000, delta=100, msg="Second instance timestamp is not close to 3000")
 
-
-
     def test_leader_election(self):
         """Test sending leader messages"""
         # Connect to establish connections with sock2
@@ -289,17 +524,18 @@ class SyncTest(unittest.TestCase):
 
         # We should see that the sync level is not 0 anymore, indicating that this node is not a leader
         sync_level = content[0]
-        self.assertTrue(sync_level != 0, "The node should not be a leader anymore")
-
-    def test_sync_start(self):
-        """Test the SYNC_START message processing"""
-        # Connect to establish relationship with the first instance
-        self.send_message(self.sock1, self.program1_address, self.program1_port, 
-                          MessageType.CONNECT)
-        _ = self.receive_message(self.sock1)  # Discard ACK_CONNECT
+        self.assertGreater(sync_level, 0, "The node should not be a leader anymore")
         
-        # Create and send a SYNC_START message to first instance
-        current_time = int(time.time() * 1000)  # Current time in milliseconds
+    def test_inter_node_synchronization(self):
+        """Test synchronization between two program instances"""
+        # Connect to the first instance
+        self.send_message(self.sock1, self.program1_address, self.program1_port,
+                          MessageType.CONNECT)
+        # Discard the ACK_CONNECT
+        _ = self.receive_message(self.sock1)
+
+        # Send a SYNC_START message to first instance
+        current_time = int(time.time() * 1000)
         sync_content = self.create_sync_start_message(0, current_time)
         self.send_message(self.sock1, self.program1_address, self.program1_port,
                           MessageType.SYNC_START, sync_content)
@@ -317,45 +553,37 @@ class SyncTest(unittest.TestCase):
         self.send_message(self.sock1, self.program1_address, self.program1_port,
                             MessageType.DELAY_RESPONSE, delay_response_content)
         
-        # Wait for the SYNC_START message, when we get it, we should know that the node has synchronized with us
-        response = self.receive_message(self.sock1, timeout = 10)
+        # Wait for the SYNC_START message
+        response = self.receive_message(self.sock1, timeout=10)
         self.assertIsNotNone(response, "Node didn't send a SYNC_START in 10 seconds")
         msg_type, content, _ = response
         self.assertEqual(msg_type, MessageType.SYNC_START,
                          f"Expected SYNC_START (11), got {msg_type}")
-        sync_level = content[0]
-        self.assertEqual(sync_level, 1, "Invalid sync level in SYNC_START message")
-        # Check that the timestamp is close to the current time
-        timestamp = struct.unpack('!Q', content[1:9])[0]
-        current_time = int(time.time() * 1000)
-        self.assertAlmostEqual(timestamp, current_time, delta=100, 
-                               msg="Timestamp in SYNC_START message is not close to current time")
-
-        # Now we'll send a GET_TIME message to the second instance,
-        # to see whether it has synchronized with the first instance
-        # But first, we need to wait a moment for the SYNC_START to be processed
+        
+        # Now check if the second instance has synchronized with the first
         time.sleep(1)
         self.send_message(self.sock2, self.program2_address, self.program2_port,
                           MessageType.GET_TIME)
         
-        # Get the TIME response
+        # Get the TIME response from second instance
         response = self.receive_message(self.sock2)
         self.assertIsNotNone(response, "No response received for GET_TIME message")
         msg_type, content, _ = response
         self.assertEqual(msg_type, MessageType.TIME,
                          f"Expected TIME (32), got {msg_type}")
-        # We should see that the sync level is 2, indicating that this node is synchronized with the first instance
+        
+        # Check sync level (should be 2 since it's synchronized with the first instance)
         sync_level = content[0]
-        self.assertTrue(sync_level == 2, "The node should be synchronized with the first instance")
-        # Check that the timestamp is close to the current time
+        self.assertEqual(sync_level, 2, "The second node should be synchronized with the first instance")
+        
+        # Check the timestamp is close to the current time
         timestamp = struct.unpack('!Q', content[1:9])[0]
         current_time = int(time.time() * 1000)
-        self.assertAlmostEqual(timestamp, current_time, delta=100, 
-                               msg="Timestamp in TIME message is not close to current time")
+        self.assertAlmostEqual(timestamp, current_time, delta=100,
+                              msg="Timestamp in TIME message is not close to current time")
 
-    def test_changed_sync_level(self):
-        """Test that the node recognises a synchronization source 
-        changing its sync level between SYNC_START and DELAY_RESPONSE as an error"""
+    def test_sync_status_timeout(self):
+        """Test that the node times out if it doesn't receive a SYNC_START in time"""
         with capture_stderr(self.program1) as stderr_capture:
             # Connect to the node
             self.send_message(self.sock1, self.program1_address, self.program1_port,
@@ -368,38 +596,35 @@ class SyncTest(unittest.TestCase):
             self.send_message(self.sock1, self.program1_address, self.program1_port,
                               MessageType.SYNC_START, sync_content)
 
-            # Wait for the DELAY_REQUEST
+            # Receive the DELAY_REQUEST
             delay_rq = self.receive_message(self.sock1)
             self.assertIsNotNone(delay_rq, "No response received for SYNC_START message")
             msg_type, content, _ = delay_rq
             self.assertEqual(msg_type, MessageType.DELAY_REQUEST,
                              f"Expected DELAY_REQUEST (12), got {msg_type}")
-
-            # Send a DELAY_RESPONSE with sync level 1
-            delay_response_content = self.create_sync_start_message(1, 0)
+            
+            # Send the DELAY_RESPONSE
+            delay_response_content = self.create_sync_start_message(0, 0)
             self.send_message(self.sock1, self.program1_address, self.program1_port,
                               MessageType.DELAY_RESPONSE, delay_response_content)
             
-            # Wait a bit for the node to process the message
-            time.sleep(1)
-            
-            # Ensure the node prints an error message
-            err_output = stderr_capture.get_output()
-            self.assertIn("ERROR", err_output.upper(),
-                   "The node should print an ERROR upon receiving a DELAY_RESPONSE with a different sync level")
+            # Wait for a while without sending a SYNC_START to the node
+            print("Going to sleep for 30 secs - be patient")
+            time.sleep(30)
 
-            # And that its still not synchronized
-            self.send_message(self.sock1, self.program1_address, self.program1_port,
-                              MessageType.GET_TIME)
+            # Send a GET_TIME to the node to check its status
+            self.send_message(self.sock2, self.program1_address, self.program1_port,
+                              MessageType.GET_TIME) 
             # Get the TIME response
-            response = self.receive_message(self.sock1)
+            response = self.receive_message(self.sock2)
             self.assertIsNotNone(response, "No response received for GET_TIME message")
             msg_type, content, _ = response
             self.assertEqual(msg_type, MessageType.TIME,
                              f"Expected TIME (32), got {msg_type}")
-            # We should see that the sync level is 255, indicating that this node is not synchronized
+
+            # We should see that the node no longer has sync level 1
             sync_level = content[0]
-            self.assertTrue(sync_level == 255, "The node should not be synchronized after an unsuccessful sync")
+            self.assertGreater(sync_level, 1, "The node should lose its sync level after a timeout")
 
 if __name__ == '__main__':
     unittest.main()

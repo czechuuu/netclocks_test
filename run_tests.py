@@ -12,6 +12,8 @@ Usage:
   ./run_tests.py               # Run all tests
   ./run_tests.py -b            # Run only basic tests
   ./run_tests.py -s            # Run only sync tests
+  ./run_tests.py -ss           # Run only single-node sync tests
+  ./run_tests.py -sm           # Run only multi-node sync tests
   ./run_tests.py -e            # Run only error tests
   ./run_tests.py -v            # Run with verbose output
 """
@@ -21,7 +23,11 @@ def main():
     parser.add_argument('-b', '--basic', action='store_true', 
                         help='Run only basic tests')
     parser.add_argument('-s', '--sync', action='store_true', 
-                        help='Run only synchronization tests')
+                        help='Run all synchronization tests')
+    parser.add_argument('-ss', '--single-sync', action='store_true',
+                        help='Run only single-node synchronization tests')
+    parser.add_argument('-sm', '--multi-sync', action='store_true',
+                        help='Run only multi-node synchronization tests')
     parser.add_argument('-e', '--error', action='store_true',
                         help='Run only error handling tests')
     parser.add_argument('-v', '--verbose', action='store_true', 
@@ -35,7 +41,7 @@ def main():
     test_suite = unittest.TestSuite()
     
     # If no specific test type is selected, run all tests
-    run_all = not (args.basic or args.sync or args.error)
+    run_all = not (args.basic or args.sync or args.single_sync or args.multi_sync or args.error)
     
     if args.basic or run_all:
         # Add basic tests
@@ -44,12 +50,23 @@ def main():
         basic_tests = loader.loadTestsFromTestCase(BasicTest)
         test_suite.addTest(basic_tests)
     
-    if args.sync or run_all:
-        # Add sync tests
-        print("Including synchronization tests...")
-        from test_sync import SyncTest
-        sync_tests = loader.loadTestsFromTestCase(SyncTest)
-        test_suite.addTest(sync_tests)
+    # Handle sync tests based on flags
+    run_single_sync = args.sync or args.single_sync or run_all
+    run_multi_sync = args.sync or args.multi_sync or run_all
+    
+    if run_single_sync:
+        # Add single-node sync tests
+        print("Including single-node synchronization tests...")
+        from test_sync import SingleNodeSyncTest
+        single_sync_tests = loader.loadTestsFromTestCase(SingleNodeSyncTest)
+        test_suite.addTest(single_sync_tests)
+        
+    if run_multi_sync:
+        # Add multi-node sync tests
+        print("Including multi-node synchronization tests...")
+        from test_sync import MultiNodeSyncTest
+        multi_sync_tests = loader.loadTestsFromTestCase(MultiNodeSyncTest)
+        test_suite.addTest(multi_sync_tests)
         
     if args.error or run_all:
         # Add error handling tests
