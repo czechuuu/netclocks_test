@@ -274,10 +274,16 @@ class SingleNodeSyncTest(unittest.TestCase):
             # Send a DELAY_REQUEST to the node
             self.send_message(MessageType.DELAY_REQUEST)
             
-            # Check that the node recognizes this as an error
-            err_output = stderr_capture.get_output()
-            self.assertIn("ERROR MSG", err_output.upper(),
-                   "The node should print an ERROR receiving a DELAY_REQUEST after a LEADER_STOP")
+            # Receive the DELAY_RESPONSE
+            response = self.receive_message(timeout=3)
+            self.assertIsNotNone(response, "No response received for DELAY_REQUEST message")
+            msg_type, content, _ = response
+            self.assertEqual(msg_type, MessageType.DELAY_RESPONSE,
+                             f"Expected DELAY_RESPONSE (12), got {msg_type}")
+            
+            # We should see that the sync level is 255, indicating that this node is not synchronized
+            sync_level = content[0]
+            self.assertTrue(sync_level == 255, "The node should not be synchronized after taking away its leader status")
 
 
 class MultiNodeSyncTest(unittest.TestCase):
