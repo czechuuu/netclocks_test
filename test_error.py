@@ -7,38 +7,20 @@ import unittest
 import os
 import signal
 from enum import IntEnum
-import ipaddress
 import sys
 import threading
 
 """
-Test script for the netclocks program.
-This script tests basic functionality by:
-1. Starting the netclocks program
-2. Sending various messages to it
-3. Verifying the responses
+Error handling test script for the netclocks program.
+This script tests error handling capabilities by:
+1. Sending invalid messages to a running program instance
+2. Verifying appropriate error responses in stderr
+3. Testing handling of various malformed/invalid messages
 """
 
-from test_utils import MessageType, LeaderState, is_stderr_capture_active
-
-# Message types matching the C++ enum
-class MessageType(IntEnum):
-    INVALID = -1
-    HELLO = 1
-    HELLO_REPLY = 2
-    CONNECT = 3
-    ACK_CONNECT = 4
-    SYNC_START = 11
-    DELAY_REQUEST = 12
-    DELAY_RESPONSE = 13
-    LEADER = 21
-    GET_TIME = 31
-    TIME = 32
-
-# Leader states matching the C++ enum
-class LeaderState(IntEnum):
-    LEADER_BEGIN = 0
-    LEADER_STOP = 255
+from test_utils import (MessageType, LeaderState, capture_stderr, 
+                        create_invalid_message, create_malformed_message,
+                        send_and_assert_error, is_stderr_capture_active)
 
 def output_reader(process, prefix):
     """Read output from a process and print it with a prefix"""
@@ -63,11 +45,11 @@ def output_reader(process, prefix):
             # If capture is active, wait briefly before checking again
             time.sleep(0.1)
 
-class NetclocksTest(unittest.TestCase):
-    """Base class for netclocks tests"""
+class SingleNodeErrorTest(unittest.TestCase):
+    """Error handling tests for a single node setup"""
     
     def setUp(self):
-        """Setup test environment"""
+        """Setup test environment with a single program instance"""
         self.program_path = "../peer-time-sync"
         self.program_port = 12345
         self.program_address = "127.0.0.1"
@@ -87,7 +69,7 @@ class NetclocksTest(unittest.TestCase):
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             bufsize=1,
-            text=True  # Use text mode instead of binary mode
+            text=True
         )
         
         # Start output reader thread
@@ -135,70 +117,57 @@ class NetclocksTest(unittest.TestCase):
             return None
         except socket.timeout:
             return None
+            
+    def create_sync_start_message(self, sync_level, timestamp):
+        """Create a SYNC_START message"""
+        # 1 byte sync level + 8 byte timestamp (big endian)
+        return bytes([sync_level]) + struct.pack('!Q', timestamp)
 
-class BasicTest(NetclocksTest):
-    """Basic functionality tests"""
+    def test_invalid_message_type(self):
+        """Test handling of invalid message type"""
+        # Using our helper function to send invalid message and verify error
+        output = send_and_assert_error(
+            self, self.sock, self.program_address, self.program_port,
+            create_invalid_message(), process=self.program
+        )
+        
+        # You can add more specific assertions here
+        self.assertIn("ERROR MSG", output.upper(), 
+                      "Error should mention invalid message type")
     
-    def test_hello(self):
-        """Test HELLO message and expect HELLO_REPLY"""
-        # Send HELLO message
-        self.send_message(MessageType.HELLO)
+    def test_malformed_sync_start(self):
+        """Test handling of malformed SYNC_START message"""
+        # Test with truncated message
+        output = send_and_assert_error(
+            self, self.sock, self.program_address, self.program_port,
+            create_malformed_message(MessageType.SYNC_START, 'truncated'),
+            process=self.program
+        )
+        self.assertIn("ERROR MSG", output.upper())
         
-        # Expect HELLO_REPLY
-        response = self.receive_message()
-        self.assertIsNotNone(response, "No response received for HELLO message")
-        
-        msg_type, content, _ = response
-        self.assertEqual(msg_type, MessageType.HELLO_REPLY, 
-                         f"Expected HELLO_REPLY (2), got {msg_type}")
-        
-        # HELLO_REPLY should have exactly 3 bytes (type + node count)
-        self.assertEqual(len(content) + 1, 3, 
-                         "HELLO_REPLY message length is not 3 bytes")
-        # Parse the node count from the response
-        node_count = struct.unpack('!H', content)[0]
-                
-        # Verify node count is zero
-        self.assertEqual(node_count, 0,
-                         "HELLO_REPLY node count is not zero")
+        # Test with wrong size content
+        output = send_and_assert_error(
+            self, self.sock, self.program_address, self.program_port,
+            create_malformed_message(MessageType.SYNC_START, 'wrong_size'),
+            process=self.program
+        )
+        self.assertIn("ERROR MSG", output.upper())
+                      
+    def test_unknown_sync_start(self):
+        """Test that the program properly handles a sync start from an unconnected node."""
+        with capture_stderr(self.program) as stderr_capture:
+            # Send a sync_start to the node without connecting first
+            sync_content = self.create_sync_start_message(0, 0)
+            self.send_message(MessageType.SYNC_START, sync_content)
 
-    def test_connect(self):
-        """Test CONNECT message and expect ACK_CONNECT"""
-        # Send CONNECT message
-        self.send_message(MessageType.CONNECT)
-        
-        # Expect ACK_CONNECT
-        response = self.receive_message()
-        self.assertIsNotNone(response, "No response received for CONNECT message")
-        
-        msg_type, _, _ = response
-        self.assertEqual(msg_type, MessageType.ACK_CONNECT, 
-                         f"Expected ACK_CONNECT (4), got {msg_type}")
+            # Check that the node does not respond to us
+            response = self.receive_message(timeout=1)
+            self.assertIsNone(response, "The node should not respond to a SYNC_START from someone they do not know")
 
-    def test_get_time(self):
-        """Test GET_TIME message and expect TIME response"""
-        # Send GET_TIME message
-        self.send_message(MessageType.GET_TIME)
-        
-        # Expect TIME response
-        response = self.receive_message()
-        self.assertIsNotNone(response, "No response received for GET_TIME message")
-        
-        msg_type, content, _ = response
-        self.assertEqual(msg_type, MessageType.TIME, 
-                         f"Expected TIME (32), got {msg_type}")
-        
-        # TIME message should have 9 bytes (type + sync_level + timestamp)
-        self.assertEqual(len(content) + 1, 10, 
-                        f"TIME message incorrect length, expected 10 bytes, got {len(content) + 1}")
-        
-        # Parse sync level and timestamp
-        sync_level = content[0]
-        timestamp = struct.unpack('!Q', content[1:9])[0]
-        
-        # Basic validation
-        self.assertEqual(sync_level, 255, "Invalid sync level")
-        self.assertGreaterEqual(timestamp, 0, "Invalid timestamp")
+            # And that it prints ERROR_MSG
+            err_output = stderr_capture.get_output()
+            self.assertIn("ERROR", err_output.upper(),
+                   "The node should print an ERROR upon receiving a SYNC_START from an unknown node")
 
 if __name__ == '__main__':
     unittest.main()

@@ -18,24 +18,7 @@ This script tests synchronization functionality by:
 3. Testing time synchronization between instances
 """
 
-# Message types matching the C++ enum
-class MessageType(IntEnum):
-    INVALID = -1
-    HELLO = 1
-    HELLO_REPLY = 2
-    CONNECT = 3
-    ACK_CONNECT = 4
-    SYNC_START = 11
-    DELAY_REQUEST = 12
-    DELAY_RESPONSE = 13
-    LEADER = 21
-    GET_TIME = 31
-    TIME = 32
-
-# Leader states matching the C++ enum
-class LeaderState(IntEnum):
-    LEADER_BEGIN = 0
-    LEADER_STOP = 255
+from test_utils import MessageType, LeaderState, capture_stderr, is_stderr_capture_active
 
 def output_reader(process, prefix):
     """Read output from a process and print it with a prefix"""
@@ -43,8 +26,22 @@ def output_reader(process, prefix):
     for line in iter(process.stdout.readline, ''):
         sys.stdout.write(f"[{prefix}] {line}")
     
-    for line in iter(process.stderr.readline, ''):
-        sys.stderr.write(f"[{prefix}] {line}")
+    # For stderr, check if stderr capture is active before reading
+    while True:
+        # Skip stderr reading if capture is active to avoid conflicts
+        if not is_stderr_capture_active():
+            try:
+                line = process.stderr.readline()
+                if not line:
+                    # No more data, exit the loop
+                    break
+                sys.stderr.write(f"[{prefix}] {line}")
+            except (IOError, ValueError):
+                # Handle pipe errors or closed file
+                break
+        else:
+            # If capture is active, wait briefly before checking again
+            time.sleep(0.1)
 
 class SyncTest(unittest.TestCase):
     """Tests for synchronization functionality"""
@@ -355,6 +352,54 @@ class SyncTest(unittest.TestCase):
         current_time = int(time.time() * 1000)
         self.assertAlmostEqual(timestamp, current_time, delta=100, 
                                msg="Timestamp in TIME message is not close to current time")
+
+    def test_changed_sync_level(self):
+        """Test that the node recognises a synchronization source 
+        changing its sync level between SYNC_START and DELAY_RESPONSE as an error"""
+        with capture_stderr(self.program1) as stderr_capture:
+            # Connect to the node
+            self.send_message(self.sock1, self.program1_address, self.program1_port,
+                            MessageType.CONNECT)
+            # Discard the ACK_CONNECT
+            _ = self.receive_message(self.sock1)
+
+            # Send a sync start to the node
+            sync_content = self.create_sync_start_message(0, 0)
+            self.send_message(self.sock1, self.program1_address, self.program1_port,
+                              MessageType.SYNC_START, sync_content)
+
+            # Wait for the DELAY_REQUEST
+            delay_rq = self.receive_message(self.sock1)
+            self.assertIsNotNone(delay_rq, "No response received for SYNC_START message")
+            msg_type, content, _ = delay_rq
+            self.assertEqual(msg_type, MessageType.DELAY_REQUEST,
+                             f"Expected DELAY_REQUEST (12), got {msg_type}")
+
+            # Send a DELAY_RESPONSE with sync level 1
+            delay_response_content = self.create_sync_start_message(1, 0)
+            self.send_message(self.sock1, self.program1_address, self.program1_port,
+                              MessageType.DELAY_RESPONSE, delay_response_content)
+            
+            # Wait a bit for the node to process the message
+            time.sleep(1)
+            
+            # Ensure the node prints an error message
+            err_output = stderr_capture.get_output()
+            self.assertIn("ERROR", err_output.upper(),
+                   "The node should print an ERROR upon receiving a DELAY_RESPONSE with a different sync level")
+
+            # And that its still not synchronized
+            self.send_message(self.sock1, self.program1_address, self.program1_port,
+                              MessageType.GET_TIME)
+            # Get the TIME response
+            response = self.receive_message(self.sock1)
+            self.assertIsNotNone(response, "No response received for GET_TIME message")
+            msg_type, content, _ = response
+            self.assertEqual(msg_type, MessageType.TIME,
+                             f"Expected TIME (32), got {msg_type}")
+            # We should see that the sync level is 255, indicating that this node is not synchronized
+            sync_level = content[0]
+            self.assertTrue(sync_level == 255, "The node should not be synchronized after an unsuccessful sync")
 
 if __name__ == '__main__':
     unittest.main()
